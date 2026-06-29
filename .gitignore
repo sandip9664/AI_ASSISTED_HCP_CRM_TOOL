@@ -1,0 +1,49 @@
+# ====================================================================
+# 1. PYTHON BACKEND (backend/)
+# ====================================================================
+
+# Python Virtual Environments
+backend/myenv/
+backend/venv/
+
+# LangGraph & Local Databases
+backend/.checkpoints/
+backend/langgraph.db
+*.db
+*.sqlite3
+
+# Python Bytecode & Cache
+**/__pycache__/
+backend/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Sensitive Environment Variables (Database/API Keys)
+backend/.env
+
+# ====================================================================
+# 2. JAVASCRIPT FRONTEND (pharma-crm-frontend/)
+# ====================================================================
+
+# Node Dependencies
+pharma-crm-frontend/node_modules/
+**/node_modules/
+
+# Production Builds
+pharma-crm-frontend/dist/
+pharma-crm-frontend/build/
+
+# Frontend Logs & Caches
+pharma-crm-frontend/.eslintcache
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ====================================================================
+# 3. SYSTEM & IDE ARTIFACTS
+# ====================================================================
+.DS_Store
+Thumbs.db
+.vscode/
