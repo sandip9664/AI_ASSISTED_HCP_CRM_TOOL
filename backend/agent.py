@@ -16,10 +16,10 @@ from langgraph.prebuilt import ToolNode
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode
-from models import SessionLocal
 
- 
 load_dotenv()
+
+from models import SessionLocal
  
  
 
@@ -97,17 +97,18 @@ tools_list = [log_interaction_tool]
     
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
-    hcp_name: Optional[str] = Field(None, description="The standardized name of the healthcare professional")
-    specialty: Optional[str] = Field(None, description="The medical specialty of the HCP")
-    hospital: Optional[str] = Field(None, description="The hospital or clinic name where HCP works")
-    thread_id: Optional[str] = Field(None, description="The unique thread ID for this HCP conversation session")
-    meeting_notes: Optional[str] = Field(None, description="The raw or summarized discussion context extracted from the interaction")
-    product_discussed: Optional[str] = Field("General", description="The therapeutic drug or portfolio name discussed during the meeting")
-    sentiment: Optional[str] = Field("Neutral", description="The clinician's perceived response: Positive, Neutral, or Negative")
-    interaction_outcome: Optional[str] = Field(None, description="Next steps or core decisions reached during the meeting")
-    follow_up_date: Optional[str] = Field(None, description="The targeted next touchpoint date formatted as YYYY-MM-DD")
-    date_and_time: Optional[str] = Field(None, description="The specific date and time of the interaction event (e.g., '2026-05-21 15:45')")
-    meeting_type: Literal['Meeting','Call','Email','Webinar','None']
+    hcp_name: Optional[str]
+    specialty: Optional[str]
+    hospital: Optional[str]
+    thread_id: Optional[str]
+    meeting_notes: Optional[str]
+    product_discussed: Optional[str]
+    sentiment: Optional[str]
+    interaction_outcome: Optional[str]
+    follow_up_date: Optional[str]
+    date_and_time: Optional[str]
+    meeting_type: Optional[str]
+    extracted_log_data: Optional[dict]
 
 llm = ChatGroq(
     temperature=0,
@@ -130,43 +131,52 @@ def chatbot(state: AgentState, config: RunnableConfig):
     current_time_ref = now.strftime("%H:%M")
 
     system_prompt = SystemMessage(
-        content=(
-            f"You are an expert AI assistant helping Pharma Sales Representatives log interactions.\n"
-            f"Current context: Working with HCP: '{active_hcp}' under Session Thread ID: '{active_thread_id}'.\n"
-            f"Reference Current Date: {current_date_ref}\n"
-            f"Reference Current Time: {current_time_ref}\n\n"
-            "CRITICAL AUTOMATION & ZERO-INTERRUPTION RULES:\n"
-            "1. DO NOT ask the user to confirm dates, times, formats, or follow-ups. Never ask questions like 'Can you confirm the date?' or 'What time?'.\n"
-            "2. AUTOMATICALLY INFER MISSING VALUES: If the user says 'today', 'yesterday', 'just now', or describes an interaction without explicitly specifying a exact time/date, you MUST automatically assume it happened today at the current time.\n"
-            "   - Use the 'Reference Current Date' value for the date field.\n"
-            "   - Use the 'Reference Current Time' value for the time field.\n"
-            "3. ZERO DELAY: Proceed directly to triggering `log_interaction_tool`  immediately on the very first turn. Never stall the user by listing requirements.\n"
-            "4. STAGE ALL COMPONENT FIELDS:\n"
-            "   - interaction_type: MUST match one of choices exactly: 'Meeting', 'Call', 'Email', 'Webinar'. (Default to 'Meeting' if unclear).\n"
-            "   - date & follow_up_date: MUST be formatted as standard 'YYYY-MM-DD'.\n"
-            "   - time: MUST be formatted as 24-hour military text string 'HH:MM'.\n"
-            "   - sentiment: Infer the tone from the user's report and map to exactly: 'Positive', 'Neutral', or 'Negative'. Do not leave it blank.\n"
-            f"   - chat_thread_id: You MUST pass the active session value: '{active_thread_id}' directly."
-        )
+    content=(
+        f"You are an expert AI assistant helping Pharma Sales Representatives log interactions.\n"
+        f"HCP: '{active_hcp}' | Session Thread ID: '{active_thread_id}'\n"
+        f"Current Date: {current_date_ref} | Current Time: {current_time_ref}\n\n"
+        "RULES:\n"
+        "1. Never ask the user to confirm dates, times, or field formats — the tool schema defines valid formats, infer silently.\n"
+        "2. If the user gives no explicit date/time (e.g. 'today', 'just now', 'yesterday'), use the Current Date/Time above.\n"
+        "3. Call `log_interaction_tool` immediately on the first turn — never stall or list requirements.\n"
+        f"4. Always pass chat_thread_id='{active_thread_id}' to the tool exactly as given."
     )
+)
     messages = [system_prompt] + state["messages"]
     response = llm_with_tool.invoke(messages)
-    return {"messages": [response]}
+
+    extracted_log_data = None
+    for msg in state["messages"]:
+        text = ""
+        if isinstance(msg.content, str):
+            text = msg.content
+        elif isinstance(msg.content, list):
+            for block in msg.content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text += block.get("text", "")
+        if "EXTRACTED_LOG_DATA:" in text:
+            try:
+                json_str = text.split("EXTRACTED_LOG_DATA:", 1)[1].strip()
+                extracted_log_data = json.loads(json_str)
+                if isinstance(extracted_log_data, dict):
+                    extracted_log_data["date"] = current_date_ref
+                    extracted_log_data["time"] = current_time_ref
+            except Exception:
+                pass
+            break
+
+    return {"messages": [response], "extracted_log_data": extracted_log_data}
  
 
+graph_builder = StateGraph(AgentState)
+graph_builder.add_node("chatbot", chatbot)
+graph_builder.add_node("tools", ToolNode(tools=tools_list))
 
-try:
-    graph_builder = StateGraph(AgentState)
-    graph_builder.add_node("chatbot", chatbot)
-    graph_builder.add_node("tools", ToolNode(tools=tools_list))
-
-    graph_builder.add_edge(START, "chatbot")
-    graph_builder.add_conditional_edges(
-            "chatbot",
-            lambda state: "tools" if state["messages"][-1].tool_calls else END,
-        )
-    graph_builder.add_edge("tools", "chatbot")
-except Exception as e:
-    graph_builder_error = str(e)
+graph_builder.add_edge(START, "chatbot")
+graph_builder.add_conditional_edges(
+        "chatbot",
+        lambda state: "tools" if state["messages"][-1].tool_calls else END,
+    )
+graph_builder.add_edge("tools", "chatbot")
 
     

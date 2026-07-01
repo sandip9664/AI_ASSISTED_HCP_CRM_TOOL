@@ -1,373 +1,222 @@
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 import re
 from datetime import datetime
 import json
 import os
 import uvicorn
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+from supabase import create_client
 
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from langchain_core.messages import HumanMessage
 from langchain_groq import ChatGroq
-from sqlalchemy import text
 
-
-from psycopg import Connection
+import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from langgraph.checkpoint.postgres import PostgresSaver
 
 from agent import graph_builder
-from models import SessionLocal, engine, Base, HCP  
+from models import SessionLocal, engine, Base, HCP, Interaction  
 
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_DB_URL:
+    raise ValueError("SUPABASE_DB_URL environment variable is missing!")
+
+if not SUPABASE_URL:
+    raise ValueError("SUPABASE_URL environment variable is missing!")
+if not SUPABASE_SERVICE_ROLE_KEY:
+    raise ValueError("SUPABASE_SERVICE_ROLE_KEY environment variable is missing!")
+
 pool = ConnectionPool(conninfo=SUPABASE_DB_URL, max_size=10, open=False)
-
-
 compiled_graph = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global compiled_graph
     
-    
     Base.metadata.create_all(bind=engine)
     
-    
-    with Connection.connect(SUPABASE_DB_URL, autocommit=True, prepare_threshold=0, row_factory=dict_row) as setup_conn:
+    with psycopg.connect(SUPABASE_DB_URL, autocommit=True, prepare_threshold=0, row_factory=dict_row) as setup_conn:
         setup_checkpointer = PostgresSaver(setup_conn)
         setup_checkpointer.setup()
-    
     
     pool.open()
     checkpointer = PostgresSaver(pool)
     compiled_graph = graph_builder.compile(checkpointer=checkpointer)
-    
     yield
-    
-    
     pool.close()
-    engine.dispose()
-    
 
 app = FastAPI(lifespan=lifespan)
 
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ----------------------------------------------------------------------
+# SECURITY DEPENDENCY: Supabase Auth Client & Validator
+# ----------------------------------------------------------------------
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-class ManualLogRequest(BaseModel):
-    hcpName: str
-    interactionType: str
-    date: str
-    time: str
-    attendees: Optional[str] = ""
-    topicsDiscussed: Optional[str] = ""
-    sentiment: str
-    outcomes: Optional[str] = ""
-    followUpActions: Optional[str] = ""
-
-
+def get_current_tenant(authorization: Optional[str] = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Authorization header token is missing or malformed."
+        )
+    
+    token = authorization.split(" ")[1]
+    
+    try:
+        user_response = supabase.auth.get_user(token)
+        return user_response.user.id
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Could not validate credentials or session expired."
+        )
+# ----------------------------------------------------------------------
+# PYDANTIC SCHEMAS
+# ----------------------------------------------------------------------
 class ChatRequest(BaseModel):
     message: str
     hcp_name: str
-    specialty: str
-    hospital: str
+    specialty: Optional[str] = ""
+    hospital: Optional[str] = ""
 
-class ExtractedCRMFields(BaseModel):
-    interactionType: Optional[str] = None
-    date: Optional[str] = None
-    time: Optional[str] = None
-    topicsDiscussed: Optional[str] = None
-    sentiment: Optional[str] = None
-    outcomes: Optional[str] = None
-    followUpActions: Optional[str] = None
+class ManualLogRequest(BaseModel):
+    hcpName: str
+    interactionType: Optional[str] = "Meeting"
+    date: Optional[str] = ""
+    time: Optional[str] = ""
+    topicsDiscussed: Optional[str] = ""
+    sentiment: Optional[str] = "Neutral"
+    outcomes: Optional[str] = ""
+    followUpActions: Optional[str] = ""
+    specialty: Optional[str] = ""
+    hospital: Optional[str] = ""
 
-def sanitize_thread_id(hcp_name: str, specialty: str, hospital: str) -> str:
-    """Converts 'Dr. Naresh', 'Cardiology', 'Apollo Hospital' into 'dr_naresh_cardiology_apollo' for consistent thread IDs."""
-    clean_name = re.sub(r'[^a-zA-Z0-9\s]', '', hcp_name).strip().lower().replace(" ", "_")
-    clean_specialty = re.sub(r'[^a-zA-Z0-9\s]', '', specialty).strip().lower().replace(" ", "_")
-    clean_hospital = re.sub(r'[^a-zA-Z0-9\s]', '', hospital).strip().lower().replace(" ", "_")[:5]
-    return f"{clean_name}_{clean_specialty}_{clean_hospital}"
- 
+# ----------------------------------------------------------------------
+# HELPER UTILITIES
+# ----------------------------------------------------------------------
+def sanitize_thread_id(name: str, spec: str, hosp: str) -> str:
+    combined = f"{name}_{spec}_{hosp}".lower()
+    return re.sub(r'[^a-z0-9_]', '', combined.replace(" ", "_"))
 
-def get_or_create_hcp(connection, name: str, specialty: str, hospital: str) -> tuple[int, str]:
-    name_str = name.strip()
-    spec_str = specialty.strip() if specialty else "General Medicine"
-    hosp_str = hospital.strip() if hospital else "Unknown Hospital"
+def get_or_create_hcp(db, tenant_id: str, name: str, specialty: str, hospital: str) -> HCP:
+    hcp = db.query(HCP).filter(
+        HCP.tenant_id == tenant_id, 
+        HCP.name == name,
+        HCP.specialty == specialty,
+        HCP.hospital == hospital
+    ).first()
     
-    
-    row = connection.execute(
-        text("SELECT id, chat_thread_id FROM hcps WHERE name = :name AND specialty = :specialty AND hospital = :hospital;"),
-        {"name": name_str, "specialty": spec_str, "hospital": hosp_str}
-    ).fetchone()
-    
-    if row:
-        return row[0], row[1]
-    
-    generated_thread = sanitize_thread_id(name_str, spec_str, hosp_str)
-    insert_stmt = connection.execute(
-        text("""
-            INSERT INTO hcps (name, specialty, hospital, chat_thread_id, created_at) 
-            VALUES (:name, :specialty, :hospital, :chat_thread_id, :created_at) 
-            RETURNING id;
-        """),
-        {"name": name_str, "specialty": spec_str, "hospital": hosp_str, "chat_thread_id": generated_thread, "created_at": datetime.now()}
-    )
-    new_id = insert_stmt.fetchone()[0]
-    return new_id, generated_thread
-
-
-@app.get("/")
-def read_root():
-    return {"status": "online", "message": "Pharma CRM Backend API with Supabase Postgres Persistence running."}
-
-
-@app.post("/api/log-manual", status_code=status.HTTP_201_CREATED)
-async def log_manual_endpoint(payload: ManualLogRequest):
-    print(f"Direct Database Write triggered for HCP: {payload.hcpName}")
-    
-    with engine.connect() as connection:
-        try:
-            hcp_lookup = connection.execute(
-                text("SELECT id FROM hcps WHERE name = :name;"), 
-                {"name": payload.hcpName}
-            ).fetchone()
-            
-            if hcp_lookup:
-                hcp_id = hcp_lookup[0]
-            else:
-                hcp_insert = connection.execute(
-                    text("INSERT INTO hcps (name, created_at) VALUES (:name, :created_at) RETURNING id;"),
-                    {"name": payload.hcpName, "created_at": datetime.now()}
-                )
-                hcp_id = hcp_insert.fetchone()[0]
-
-            query = text("""
-                INSERT INTO interactions (
-                    hcp_id, 
-                    product_discussed,
-                    meeting_notes, 
-                    sentiment, 
-                    interaction_outcome, 
-                    follow_up_date,
-                    created_at
-                ) 
-                VALUES (:hcp_id, :product_discussed, :meeting_notes, :sentiment, :interaction_outcome, :follow_up_date, :created_at)
-                RETURNING id;
-            """)
-            
-            combined_notes = f"Type: {payload.interactionType}. Notes: {payload.topicsDiscussed}."
-            
-            parsed_date = None
-            if payload.date and payload.date.strip():
-                try:
-                    parsed_date = datetime.strptime(payload.date.strip(), "%Y-%m-%d")
-                except ValueError:
-                    parsed_date = None
-
-            result = connection.execute(query, {
-                "hcp_id": hcp_id,
-                "product_discussed": "General",  
-                "meeting_notes": combined_notes,
-                "sentiment": payload.sentiment,
-                "interaction_outcome": payload.outcomes if payload.outcomes else payload.followUpActions,
-                "follow_up_date": parsed_date,
-                "created_at": datetime.now()
-            })
-            
-            connection.commit()
-            inserted_id = result.fetchone()[0]
-            
-            return {
-                "status": "success",
-                "message": f"Successfully committed log for {payload.hcpName}",
-                "record_id": inserted_id
-            }
-            
-        except Exception as e:
-            connection.rollback()
-            print(f"Database write operation exception: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to record manual log entry into central ledger: {str(e)}"
-            )
-
-
-@app.post("/api/chat")
-async def chat_with_agent(request: ChatRequest):
-    try:
-        if compiled_graph is None:
-            raise HTTPException(status_code=500, detail="Graph structure is uninitialized.")
-
-        with engine.connect() as connection:
-            hcp_id, thread_id = get_or_create_hcp(connection, request.hcp_name, request.specialty, request.hospital)
-            connection.commit()
-
-        config = {
-            "configurable": {
-                "thread_id": thread_id,
-                "hcp_name": request.hcp_name,
-                "specialty": request.specialty,
-                "hospital": request.hospital
-            }
-        }
-
+    if not hcp:
+        raw_slug = sanitize_thread_id(name, specialty, hospital)
+        scoped_thread_id = f"{tenant_id}_{raw_slug}"
         
-        events = compiled_graph.stream(
-            {"messages": [HumanMessage(content=request.message)]},
-            config,
-            stream_mode="values",
+        hcp = HCP(
+            tenant_id=tenant_id,
+            name=name,
+            specialty=specialty,
+            hospital=hospital,
+            chat_thread_id=scoped_thread_id
         )
+        db.add(hcp)
+        db.commit()
+        db.refresh(hcp)
+    return hcp
 
-        final_state = None
-        for event in events:
-            final_state = event
+def verify_thread_ownership(db, tenant_id: str, thread_id: str) -> HCP:
+    hcp = db.query(HCP).filter(
+        HCP.chat_thread_id == thread_id,
+        HCP.tenant_id == tenant_id
+    ).first()
+    if not hcp:
+        raise HTTPException(status_code=404, detail="HCP Context not found or access denied.")
+    return hcp
 
-        final_response = final_state["messages"][-1]
-        
-        extracted_fields = {}
-        messages_list = final_state.get("messages", [])
+# ----------------------------------------------------------------------
+# ENDPOINTS
+# ----------------------------------------------------------------------
 
-        for msg in messages_list:
-            content_str = ""
-            if hasattr(msg, "content") and isinstance(msg.content, str):
-                content_str = msg.content
-
-            if "EXTRACTED_LOG_DATA:" in content_str:
-                try:
-                    raw_json = content_str.split("EXTRACTED_LOG_DATA:")[1].strip()
-                    extracted_fields.update(json.loads(raw_json))
-                except Exception:
-                    pass
-            elif "EXTRACTED_EDIT_DATA:" in content_str:
-                try:
-                    raw_json = content_str.split("EXTRACTED_EDIT_DATA:")[1].strip()
-                    extracted_fields.update(json.loads(raw_json))
-                except Exception:
-                    pass
-
-        validated_fields = ExtractedCRMFields(**extracted_fields).model_dump(exclude_none=True)
-
-        return {
-            "thread_id": thread_id,
-            "hcp_name": request.hcp_name,
-            "response": getattr(final_response, 'content', None),
-            "extracted_fields": validated_fields
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    
-@app.get("/api/chat/history/{thread_id}")
-async def get_chat_history(thread_id: str):
+@app.get("/api/hcps")
+async def get_my_hcp_registry(tenant_id: str = Depends(get_current_tenant)):
+    db = SessionLocal()
     try:
-        if compiled_graph is None:
-            raise HTTPException(status_code=500, detail="Graph structure is uninitialized.")
-
-        config = {"configurable": {"thread_id": thread_id}}
-
-        state_history = list(compiled_graph.get_state_history(config))
-        state_history.reverse()
-
-        formatted_messages = []
-        seen_ids = set()
-
-        for state in state_history:
-            if not state or not state.values:
-                continue
-            messages = state.values.get("messages", [])
-            ts = None
-            try:
-                
-                if hasattr(state, 'metadata') and state.metadata and state.metadata.get("timestamp"):
-                    ts = state.metadata.get("timestamp")
-            except Exception:
-                pass
-
-            for msg in messages:
-                msg_id = getattr(msg, 'id', None)
-                if msg_id and msg_id in seen_ids:
-                    continue
-                if msg_id:
-                    seen_ids.add(msg_id)
-
-                mtype = getattr(msg, 'type', None)
-                content = getattr(msg, 'content', None)
-                
-                if mtype == "human":
-                    formatted_messages.append({"sender": "user", "text": content, "timestamp": ts})
-                elif mtype == "ai" and content:
-                    formatted_messages.append({"sender": "ai", "text": content, "timestamp": ts})
-                elif mtype == "system":
-                    formatted_messages.append({"sender": "system", "text": content, "timestamp": ts})
-
-        return {"thread_id": thread_id, "messages": formatted_messages}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to extract chat state: {str(e)}")
-
-
-@app.get('/api/hcps')
-def get_hcps():
-    try:
-        db = SessionLocal()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB session failed: {str(e)}")
-
-    try:
-        rows = db.query(HCP).all()
-        result = []
-        for r in rows:
-            result.append({
-                'id': r.id,
-                'name': r.name,
-                'specialty': r.specialty,
-                'hospital': r.hospital,
-                'chat_thread_id': r.chat_thread_id,
-                'created_at': r.created_at.isoformat() if getattr(r, 'created_at', None) else None,
-            })
-        return {'hcps': result}
+        hcps = db.query(HCP).filter(HCP.tenant_id == tenant_id).order_by(HCP.created_at.desc()).all()
+        return {"hcps": [
+            {
+                "id": hcp.id,
+                "name": hcp.name,
+                "specialty": hcp.specialty,
+                "hospital": hcp.hospital,
+                "chat_thread_id": hcp.chat_thread_id
+            } for hcp in hcps
+        ]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        try:
-            db.close()
-        except Exception:
-            pass
-    
+        db.close()
+
+@app.get("/api/chat/history/{thread_id}")
+async def get_chat_history(thread_id: str, tenant_id: str = Depends(get_current_tenant)):
+    db = SessionLocal()
+    try:
+        hcp = verify_thread_ownership(db, tenant_id, thread_id)
+        config = {"configurable": {"thread_id": hcp.chat_thread_id}}
+        state = compiled_graph.get_state(config)
+        
+        history_messages = []
+        if state and state.values and "messages" in state.values:
+            for msg in state.values["messages"]:
+                if msg.type in ["human", "ai"] and msg.content:
+                    history_messages.append({
+                        "sender": "user" if msg.type == "human" else "ai",
+                        "text": msg.content
+                    })
+        return {"messages": history_messages}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 @app.get("/api/chat/summary/{thread_id}")
-async def get_chat_summary(thread_id: str):
+async def get_transcript_summary(thread_id: str, tenant_id: str = Depends(get_current_tenant)):
+    db = SessionLocal()
     try:
-        if compiled_graph is None:
-            raise HTTPException(status_code=500, detail="Graph structure is uninitialized.")
-
-        config = {"configurable": {"thread_id": thread_id}}
-        state_history = list(compiled_graph.get_state_history(config))
+        hcp = verify_thread_ownership(db, tenant_id, thread_id)
+        config = {"configurable": {"thread_id": hcp.chat_thread_id}}
+        state = compiled_graph.get_state(config)
         
         formatted_logs = []
-        if state_history:
-            latest_state = state_history[0]
-            messages = latest_state.values.get("messages", [])
-            for msg in messages:
+        if state and state.values and "messages" in state.values:
+            for msg in state.values["messages"]:
                 if msg.type == "human":
                     formatted_logs.append(f"Rep: {msg.content}")
                 elif msg.type == "ai" and msg.content:
                     formatted_logs.append(f"AI: {msg.content}")
-                    
+        
         if not formatted_logs:
             return {"summary": "No historical chat transcript exists for this HCP context yet."}
-            
+        
         transcript_block = "\n".join(formatted_logs)
         
         summary_llm = ChatGroq(
@@ -377,22 +226,76 @@ async def get_chat_summary(thread_id: str):
         )
         
         prompt = (
-            "You are an expert pharmaceutical CRM data specialist. Review the following conversational interaction "
-            "history transcript between a Pharma Sales Representative and an AI Assistant regarding an HCP.\n"
+            "Review the following pharmaceutical interaction transcript.\n"
             "Generate a clear, high-impact bulleted executive summary covering:\n"
-            "- Key Therapeutic/Product Discussion Topics\n"
-            "- Observed Doctor Posture & Sentiment\n"
-            "- Main Outcomes & Planned Follow-up Touchpoints\n\n"
+            "- Key Discussion Topics\n"
+            "- Observed Sentiment\n"
+            "- Outcomes & Follow-ups\n\n"
             f"Transcript Data:\n{transcript_block}"
         )
         
         response = summary_llm.invoke([HumanMessage(content=prompt)])
         return {"summary": response.content.strip()}
-        
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to compile conversational summary: {str(e)}")
-    
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+@app.post("/api/chat")
+async def chat_with_agent(request: ChatRequest, tenant_id: str = Depends(get_current_tenant)):
+    db = SessionLocal()
+    try:
+        hcp = get_or_create_hcp(db, tenant_id, request.hcp_name, request.specialty, request.hospital)
+        config = {
+            "configurable": {
+                "thread_id": hcp.chat_thread_id,
+                "tenant_id": tenant_id,
+                "hcp_name": hcp.name
+            }
+        }
+        result = compiled_graph.invoke({"messages": [HumanMessage(content=request.message)]}, config=config)
+        final_message = result["messages"][-1].content if result["messages"] else "Processing complete."
+
+        extracted_fields = result.get("extracted_log_data") or {}
+
+        return {"response": final_message, "extracted_fields": extracted_fields, "chat_thread_id": hcp.chat_thread_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+@app.post("/api/log-manual")
+async def log_manual_interaction(data: ManualLogRequest, tenant_id: str = Depends(get_current_tenant)):
+    db = SessionLocal()
+    try:
+        hcp = get_or_create_hcp(db, tenant_id, data.hcpName, data.specialty, data.hospital)
+
+        follow_up = None
+        if data.followUpActions:
+            try:
+                follow_up = datetime.strptime(data.followUpActions, "%Y-%m-%d")
+            except ValueError:
+                pass
+
+        new_interaction = Interaction(
+            hcp_id=hcp.id,
+            tenant_id=tenant_id,
+            meeting_notes=data.topicsDiscussed,
+            sentiment=data.sentiment,
+            interaction_outcome=data.outcomes,
+            follow_up_date=follow_up
+        )
+        db.add(new_interaction)
+        db.commit()
+        return {"status": "success", "message": "Interaction saved to database securely."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
 if __name__ == "__main__":
-    
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
