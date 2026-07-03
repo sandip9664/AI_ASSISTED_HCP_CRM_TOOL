@@ -24,6 +24,8 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from agent import graph_builder
 
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+if SUPABASE_DB_URL:
+    SUPABASE_DB_URL = SUPABASE_DB_URL.replace("+psycopg", "")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
