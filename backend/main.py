@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import re
 from datetime import datetime
 import os
+import socket
 import uvicorn
 from dotenv import load_dotenv
 
@@ -26,6 +27,15 @@ from agent import graph_builder
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 if SUPABASE_DB_URL:
     SUPABASE_DB_URL = SUPABASE_DB_URL.replace("+psycopg", "")
+    # Resolve hostname to IPv4 to avoid IPv6 connectivity issues on Render
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(SUPABASE_DB_URL)
+        if parsed.hostname:
+            ipv4 = socket.getaddrinfo(parsed.hostname, None, socket.AF_INET)[0][4][0]
+            SUPABASE_DB_URL = SUPABASE_DB_URL.replace(parsed.hostname, ipv4)
+    except Exception:
+        pass
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
