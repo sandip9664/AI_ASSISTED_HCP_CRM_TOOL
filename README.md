@@ -13,7 +13,7 @@ Log doctor interactions in plain English — the AI extracts, structures, and re
 [![Groq](https://img.shields.io/badge/Groq-LLaMA%204%20Scout-F55036?style=for-the-badge)](https://groq.com)
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://ai-assisted-hcp-crm-tool.vercel.app)
 
-### 🌐 [Live Demo → ai-assisted-hcp-crm-tool.vercel.app](https://ai-assisted-hcp-crm-tool.vercel.app)
+### 🌐 [Live Demo → ai-assisted-hcp-crm-tool.vercel.app](https://ai-assisted-hcp-crm-tool.vercel.app/#)
 
 </div>
 
