@@ -18,8 +18,6 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode
 
 load_dotenv()
-
-from models import SessionLocal
  
  
 

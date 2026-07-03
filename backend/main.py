@@ -2,13 +2,11 @@ from fastapi import FastAPI, HTTPException, status, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 import re
 from datetime import datetime
-import json
 import os
 import uvicorn
 from dotenv import load_dotenv
 
 load_dotenv()
-
 
 from supabase import create_client
 
@@ -24,7 +22,6 @@ from psycopg_pool import ConnectionPool
 from langgraph.checkpoint.postgres import PostgresSaver
 
 from agent import graph_builder
-from models import SessionLocal, engine, Base, HCP, Interaction  
 
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 
@@ -45,8 +42,6 @@ compiled_graph = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global compiled_graph
-    
-    Base.metadata.create_all(bind=engine)
     
     with psycopg.connect(SUPABASE_DB_URL, autocommit=True, prepare_threshold=0, row_factory=dict_row) as setup_conn:
         setup_checkpointer = PostgresSaver(setup_conn)
@@ -118,35 +113,29 @@ def sanitize_thread_id(name: str, spec: str, hosp: str) -> str:
     combined = f"{name}_{spec}_{hosp}".lower()
     return re.sub(r'[^a-z0-9_]', '', combined.replace(" ", "_"))
 
-def get_or_create_hcp(db, tenant_id: str, name: str, specialty: str, hospital: str) -> HCP:
-    hcp = db.query(HCP).filter(
-        HCP.tenant_id == tenant_id, 
-        HCP.name == name,
-        HCP.specialty == specialty,
-        HCP.hospital == hospital
-    ).first()
-    
+def get_or_create_hcp(tenant_id: str, name: str, specialty: str, hospital: str) -> dict:
+    result = supabase.table("hcps").select("*").eq("tenant_id", tenant_id).eq("name", name).eq("specialty", specialty).eq("hospital", hospital).maybe_single().execute()
+    hcp = result.data
+
     if not hcp:
         raw_slug = sanitize_thread_id(name, specialty, hospital)
         scoped_thread_id = f"{tenant_id}_{raw_slug}"
-        
-        hcp = HCP(
-            tenant_id=tenant_id,
-            name=name,
-            specialty=specialty,
-            hospital=hospital,
-            chat_thread_id=scoped_thread_id
-        )
-        db.add(hcp)
-        db.commit()
-        db.refresh(hcp)
+
+        data = {
+            "tenant_id": tenant_id,
+            "name": name,
+            "specialty": specialty or "General Medicine",
+            "hospital": hospital or "Unknown Hospital",
+            "chat_thread_id": scoped_thread_id
+        }
+        insert_result = supabase.table("hcps").insert(data).execute()
+        hcp = insert_result.data[0]
+
     return hcp
 
-def verify_thread_ownership(db, tenant_id: str, thread_id: str) -> HCP:
-    hcp = db.query(HCP).filter(
-        HCP.chat_thread_id == thread_id,
-        HCP.tenant_id == tenant_id
-    ).first()
+def verify_thread_ownership(tenant_id: str, thread_id: str) -> dict:
+    result = supabase.table("hcps").select("*").eq("chat_thread_id", thread_id).eq("tenant_id", tenant_id).maybe_single().execute()
+    hcp = result.data
     if not hcp:
         raise HTTPException(status_code=404, detail="HCP Context not found or access denied.")
     return hcp
@@ -157,31 +146,27 @@ def verify_thread_ownership(db, tenant_id: str, thread_id: str) -> HCP:
 
 @app.get("/api/hcps")
 async def get_my_hcp_registry(tenant_id: str = Depends(get_current_tenant)):
-    db = SessionLocal()
     try:
-        hcps = db.query(HCP).filter(HCP.tenant_id == tenant_id).order_by(HCP.created_at.desc()).all()
+        result = supabase.table("hcps").select("*").eq("tenant_id", tenant_id).order("created_at", desc=True).execute()
         return {"hcps": [
             {
-                "id": hcp.id,
-                "name": hcp.name,
-                "specialty": hcp.specialty,
-                "hospital": hcp.hospital,
-                "chat_thread_id": hcp.chat_thread_id
-            } for hcp in hcps
+                "id": hcp["id"],
+                "name": hcp["name"],
+                "specialty": hcp["specialty"],
+                "hospital": hcp["hospital"],
+                "chat_thread_id": hcp["chat_thread_id"]
+            } for hcp in result.data
         ]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
 
 @app.get("/api/chat/history/{thread_id}")
 async def get_chat_history(thread_id: str, tenant_id: str = Depends(get_current_tenant)):
-    db = SessionLocal()
     try:
-        hcp = verify_thread_ownership(db, tenant_id, thread_id)
-        config = {"configurable": {"thread_id": hcp.chat_thread_id}}
+        hcp = verify_thread_ownership(tenant_id, thread_id)
+        config = {"configurable": {"thread_id": hcp["chat_thread_id"]}}
         state = compiled_graph.get_state(config)
-        
+
         history_messages = []
         if state and state.values and "messages" in state.values:
             for msg in state.values["messages"]:
@@ -195,17 +180,14 @@ async def get_chat_history(thread_id: str, tenant_id: str = Depends(get_current_
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
 
 @app.get("/api/chat/summary/{thread_id}")
 async def get_transcript_summary(thread_id: str, tenant_id: str = Depends(get_current_tenant)):
-    db = SessionLocal()
     try:
-        hcp = verify_thread_ownership(db, tenant_id, thread_id)
-        config = {"configurable": {"thread_id": hcp.chat_thread_id}}
+        hcp = verify_thread_ownership(tenant_id, thread_id)
+        config = {"configurable": {"thread_id": hcp["chat_thread_id"]}}
         state = compiled_graph.get_state(config)
-        
+
         formatted_logs = []
         if state and state.values and "messages" in state.values:
             for msg in state.values["messages"]:
@@ -213,18 +195,18 @@ async def get_transcript_summary(thread_id: str, tenant_id: str = Depends(get_cu
                     formatted_logs.append(f"Rep: {msg.content}")
                 elif msg.type == "ai" and msg.content:
                     formatted_logs.append(f"AI: {msg.content}")
-        
+
         if not formatted_logs:
             return {"summary": "No historical chat transcript exists for this HCP context yet."}
-        
+
         transcript_block = "\n".join(formatted_logs)
-        
+
         summary_llm = ChatGroq(
             temperature=0.1,
             model_name="meta-llama/llama-4-scout-17b-16e-instruct",
             api_key=os.getenv("GROQ_API_KEY")
         )
-        
+
         prompt = (
             "Review the following pharmaceutical interaction transcript.\n"
             "Generate a clear, high-impact bulleted executive summary covering:\n"
@@ -233,26 +215,23 @@ async def get_transcript_summary(thread_id: str, tenant_id: str = Depends(get_cu
             "- Outcomes & Follow-ups\n\n"
             f"Transcript Data:\n{transcript_block}"
         )
-        
+
         response = summary_llm.invoke([HumanMessage(content=prompt)])
         return {"summary": response.content.strip()}
     except HTTPException as he:
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
 
 @app.post("/api/chat")
 async def chat_with_agent(request: ChatRequest, tenant_id: str = Depends(get_current_tenant)):
-    db = SessionLocal()
     try:
-        hcp = get_or_create_hcp(db, tenant_id, request.hcp_name, request.specialty, request.hospital)
+        hcp = get_or_create_hcp(tenant_id, request.hcp_name, request.specialty, request.hospital)
         config = {
             "configurable": {
-                "thread_id": hcp.chat_thread_id,
+                "thread_id": hcp["chat_thread_id"],
                 "tenant_id": tenant_id,
-                "hcp_name": hcp.name
+                "hcp_name": hcp["name"]
             }
         }
         result = compiled_graph.invoke({"messages": [HumanMessage(content=request.message)]}, config=config)
@@ -260,17 +239,14 @@ async def chat_with_agent(request: ChatRequest, tenant_id: str = Depends(get_cur
 
         extracted_fields = result.get("extracted_log_data") or {}
 
-        return {"response": final_message, "extracted_fields": extracted_fields, "chat_thread_id": hcp.chat_thread_id}
+        return {"response": final_message, "extracted_fields": extracted_fields, "chat_thread_id": hcp["chat_thread_id"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
 
 @app.post("/api/log-manual")
 async def log_manual_interaction(data: ManualLogRequest, tenant_id: str = Depends(get_current_tenant)):
-    db = SessionLocal()
     try:
-        hcp = get_or_create_hcp(db, tenant_id, data.hcpName, data.specialty, data.hospital)
+        hcp = get_or_create_hcp(tenant_id, data.hcpName, data.specialty, data.hospital)
 
         follow_up = None
         if data.followUpActions:
@@ -279,22 +255,18 @@ async def log_manual_interaction(data: ManualLogRequest, tenant_id: str = Depend
             except ValueError:
                 pass
 
-        new_interaction = Interaction(
-            hcp_id=hcp.id,
-            tenant_id=tenant_id,
-            meeting_notes=data.topicsDiscussed,
-            sentiment=data.sentiment,
-            interaction_outcome=data.outcomes,
-            follow_up_date=follow_up
-        )
-        db.add(new_interaction)
-        db.commit()
+        interaction_data = {
+            "hcp_id": hcp["id"],
+            "tenant_id": tenant_id,
+            "meeting_notes": data.topicsDiscussed,
+            "sentiment": data.sentiment,
+            "interaction_outcome": data.outcomes,
+            "follow_up_date": follow_up.isoformat() if follow_up else None
+        }
+        supabase.table("interactions").insert(interaction_data).execute()
         return {"status": "success", "message": "Interaction saved to database securely."}
     except Exception as e:
-        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
