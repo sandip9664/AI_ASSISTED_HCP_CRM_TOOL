@@ -5,6 +5,7 @@ from datetime import datetime
 import os
 import socket
 import uvicorn
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,15 +28,6 @@ from agent import graph_builder
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 if SUPABASE_DB_URL:
     SUPABASE_DB_URL = SUPABASE_DB_URL.replace("+psycopg", "")
-    # Resolve hostname to IPv4 to avoid IPv6 connectivity issues on Render
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(SUPABASE_DB_URL)
-        if parsed.hostname:
-            ipv4 = socket.getaddrinfo(parsed.hostname, None, socket.AF_INET)[0][4][0]
-            SUPABASE_DB_URL = SUPABASE_DB_URL.replace(parsed.hostname, ipv4)
-    except Exception:
-        pass
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -48,22 +40,39 @@ if not SUPABASE_URL:
 if not SUPABASE_SERVICE_ROLE_KEY:
     raise ValueError("SUPABASE_SERVICE_ROLE_KEY environment variable is missing!")
 
-pool = ConnectionPool(conninfo=SUPABASE_DB_URL, max_size=10, open=False)
+pool = None
 compiled_graph = None
+
+def _resolve_db_url() -> str:
+    """Resolve hostname to IPv4 at runtime (when network is available)."""
+    url = SUPABASE_DB_URL
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if parsed.hostname:
+        try:
+            ipv4 = socket.getaddrinfo(parsed.hostname, None, socket.AF_INET)[0][4][0]
+            url = url.replace(parsed.hostname, ipv4)
+        except OSError:
+            pass
+    return url
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global compiled_graph
+    global compiled_graph, pool
     
-    with psycopg.connect(SUPABASE_DB_URL, autocommit=True, prepare_threshold=0, row_factory=dict_row) as setup_conn:
+    resolved_url = _resolve_db_url()
+    
+    with psycopg.connect(resolved_url, autocommit=True, prepare_threshold=0, row_factory=dict_row) as setup_conn:
         setup_checkpointer = PostgresSaver(setup_conn)
         setup_checkpointer.setup()
     
-    pool.open()
+    pool = ConnectionPool(conninfo=resolved_url, max_size=10, open=True)
     checkpointer = PostgresSaver(pool)
     compiled_graph = graph_builder.compile(checkpointer=checkpointer)
     yield
-    pool.close()
+    if pool:
+        pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
