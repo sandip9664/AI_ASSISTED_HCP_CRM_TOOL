@@ -88,6 +88,7 @@ app.add_middleware(
 # SECURITY DEPENDENCY: Supabase Auth Client & Validator
 # ----------------------------------------------------------------------
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+supabase.postgrest.header("Prefer", "return=representation")
 
 def get_current_tenant(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
@@ -135,8 +136,8 @@ def sanitize_thread_id(name: str, spec: str, hosp: str) -> str:
     return re.sub(r'[^a-z0-9_]', '', combined.replace(" ", "_"))
 
 def get_or_create_hcp(tenant_id: str, name: str, specialty: str, hospital: str) -> dict:
-    result = supabase.table("hcps").select("*").eq("tenant_id", tenant_id).eq("name", name).eq("specialty", specialty).eq("hospital", hospital).maybe_single().execute()
-    hcp = result.data
+    result = supabase.table("hcps").select("*").eq("tenant_id", tenant_id).eq("name", name).eq("specialty", specialty).eq("hospital", hospital).limit(1).execute()
+    hcp = result.data[0] if result.data else None
 
     if not hcp:
         raw_slug = sanitize_thread_id(name, specialty, hospital)
@@ -150,13 +151,13 @@ def get_or_create_hcp(tenant_id: str, name: str, specialty: str, hospital: str) 
             "chat_thread_id": scoped_thread_id
         }
         insert_result = supabase.table("hcps").insert(data).execute()
-        hcp = insert_result.data[0]
+        hcp = insert_result.data[0] if insert_result.data else None
 
     return hcp
 
 def verify_thread_ownership(tenant_id: str, thread_id: str) -> dict:
-    result = supabase.table("hcps").select("*").eq("chat_thread_id", thread_id).eq("tenant_id", tenant_id).maybe_single().execute()
-    hcp = result.data
+    result = supabase.table("hcps").select("*").eq("chat_thread_id", thread_id).eq("tenant_id", tenant_id).limit(1).execute()
+    hcp = result.data[0] if result.data else None
     if not hcp:
         raise HTTPException(status_code=404, detail="HCP Context not found or access denied.")
     return hcp
