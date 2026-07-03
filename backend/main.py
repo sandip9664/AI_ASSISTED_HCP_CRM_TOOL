@@ -88,7 +88,7 @@ app.add_middleware(
 # SECURITY DEPENDENCY: Supabase Auth Client & Validator
 # ----------------------------------------------------------------------
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-supabase.postgrest.header("Prefer", "return=representation")
+supabase.postgrest.session.headers["Prefer"] = "return=representation"
 
 def get_current_tenant(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
