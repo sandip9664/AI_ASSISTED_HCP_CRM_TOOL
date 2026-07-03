@@ -28,3 +28,7 @@ CREATE TABLE IF NOT EXISTS interactions (
 
 CREATE INDEX IF NOT EXISTS idx_interactions_tenant_id ON interactions (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_interactions_hcp_id ON interactions (hcp_id);
+
+-- Grant permissions for service_role (used by supabase-py with service_role key)
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO service_role;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO service_role;
