@@ -6,7 +6,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 import operator
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 from langchain_core.runnables import RunnableConfig
  
 from langchain_core.messages import SystemMessage,BaseMessage, HumanMessage, AIMessage
@@ -66,6 +66,15 @@ def log_interaction_tool(
             except ValueError:
                 continue
 
+    if follow_up_date:
+        for date_fmt in ("%d-%m-%Y", "%d/%m/%Y", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d", "%d.%m.%Y", "%m.%d.%Y"):
+            try:
+                parsed = datetime.strptime(follow_up_date.strip(), date_fmt)
+                follow_up_date = parsed.strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+
     payload = {
         "interactionType": interaction_type,
         "date": date,
@@ -110,7 +119,7 @@ class AgentState(TypedDict):
 
 llm = ChatGroq(
     temperature=0,
-    model_name="meta-llama/llama-4-scout-17b-16e-instruct",
+    model_name="openai/gpt-oss-120b",
     api_key=os.getenv("GROQ_API_KEY")  )
  
  
@@ -130,21 +139,24 @@ def chatbot(state: AgentState, config: RunnableConfig):
 
     system_prompt = SystemMessage(
     content=(
-        f"You are an expert AI assistant helping Pharma Sales Representatives log interactions.\n"
-        f"HCP: '{active_hcp}' | Session Thread ID: '{active_thread_id}'\n"
-        f"Current Date: {current_date_ref} | Current Time: {current_time_ref}\n\n"
-        "RULES:\n"
-        "1. Never ask the user to confirm dates, times, or field formats — the tool schema defines valid formats, infer silently.\n"
-        "2. If the user gives no explicit date/time (e.g. 'today', 'just now', 'yesterday'), use the Current Date/Time above.\n"
-        "3. Call `log_interaction_tool` immediately on the first turn — never stall or list requirements.\n"
-        f"4. Always pass chat_thread_id='{active_thread_id}' to the tool exactly as given."
+        f"""You are an expert AI assistant helping Pharma Sales Representatives manage and log interactions.
+
+            HCP: '{active_hcp}' | Session Thread ID: '{active_thread_id}'
+            Current Date: {current_date_ref} | Current Time: {current_time_ref}
+
+            DYNAMIC ROUTING RULES:
+            1. INTENT - LOGGING: If the user provides details about a meeting, call, or interaction to be recorded, you MUST call the `log_interaction_tool` immediately. Do not stall, confirm details, or list requirements.
+            2. INTENT - Q&A: If the user asks a question, requests a summary, or wants to recall previous information, DO NOT call any logging tools. Answer directly and naturally based on the conversation history and context.
+            3. DATE/TIME INFERENCE: The tool schema defines valid formats. Never ask the user to confirm dates or times. If the user uses relative terms (e.g., 'today', 'just now', 'yesterday'), calculate the exact value silently using the Current Date/Time provided above.
+            4. AMBIGUITY: If a user message contains both a question and data to log, prioritize logging the data via the tool first, then answer the question in your text response."""
+        
     )
 )
     messages = [system_prompt] + state["messages"]
     response = llm_with_tool.invoke(messages)
 
     extracted_log_data = None
-    for msg in state["messages"]:
+    for msg in reversed(state["messages"]):
         text = ""
         if isinstance(msg.content, str):
             text = msg.content
@@ -157,8 +169,10 @@ def chatbot(state: AgentState, config: RunnableConfig):
                 json_str = text.split("EXTRACTED_LOG_DATA:", 1)[1].strip()
                 extracted_log_data = json.loads(json_str)
                 if isinstance(extracted_log_data, dict):
-                    extracted_log_data["date"] = current_date_ref
-                    extracted_log_data["time"] = current_time_ref
+                    if not extracted_log_data.get("date"):
+                        extracted_log_data["date"] = current_date_ref
+                    if not extracted_log_data.get("time"):
+                        extracted_log_data["time"] = current_time_ref
             except Exception:
                 pass
             break

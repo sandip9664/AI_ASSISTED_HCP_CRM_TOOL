@@ -224,7 +224,7 @@ async def get_transcript_summary(thread_id: str, tenant_id: str = Depends(get_cu
 
         summary_llm = ChatGroq(
             temperature=0.1,
-            model_name="meta-llama/llama-4-scout-17b-16e-instruct",
+            model_name="openai/gpt-oss-120b",
             api_key=os.getenv("GROQ_API_KEY")
         )
 
